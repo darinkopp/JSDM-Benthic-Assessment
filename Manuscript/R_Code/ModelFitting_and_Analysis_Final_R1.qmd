@@ -1,0 +1,2714 @@
+---
+title: "Analysis_4_JSDM_Assessment_"
+author: "Darin Kopp"
+format: html
+editor: visual
+---
+
+This project focuses on assessing how human factors may have disturbed physiochemical environment in streams and, in turn, alter benthic macroinvertebrate assemblages in the contiguous United States.
+
+```{r}
+library(Hmsc)
+library(ggplot2)
+library(dplyr)
+library(sf)
+library(quantregForest)
+FittedModelPath <- "Model_Fit_JSDM_Final"
+```
+
+# Summarize Model Variables
+
+Identify fitted JSDM Models
+
+```{r}
+modelnames <- grep("1819", 
+                   list.files(FittedModelPath, full.names = F), 
+                   value = T)
+```
+
+Table 1 --- descriptive statistics of models and covariates
+
+```{r}
+sumtbl <- data.frame()
+for (mn in modelnames){
+# mn <- modelnames[5]
+  print(mn)
+  ROI <- unlist(lapply(strsplit(mn, "_"), "[", 3))
+
+  #load model 
+  load(paste0(FittedModelPath, "/", mn)) # model.env
+  YData <- model.env$Y
+  
+  xdata <- model.env$XData
+  #units for SO4 "mg/L" and total precip "mm" were ln(x) transformed for JSDM
+  #Units for NTL "ug/L", PTL "ug/L", CL "mg/L", and W1_HALL "unitless" were ln(x+1) transformed for JSDM
+  #Units for LSUB_DMM "mm" were Log10(x) transformed
+  #Units for MSAT "degC" were not transformed
+  
+  xdata$NTL <- exp(xdata$NTL) - 1
+  xdata$PTL <- exp(xdata$PTL) - 1
+  xdata$CL <- exp(xdata$CL) - 1
+  xdata$SO4 <- exp(xdata$SO4)
+  xdata$W1_HALL <- exp(xdata$W1_HALL)-1
+  xdata$LSUB_DMM<-10^xdata$LSUB_DMM
+  xdata$PSUMPY_XXXX_PT<-exp(xdata$PSUMPY_XXXX_PT)
+  
+  tmp <- data.frame(Region = ROI, 
+                    site = dim(YData)[1], 
+                    genera = dim(YData)[2],
+             NTL = paste0(round(median(xdata$NTL),2), " (", round(min(xdata$NTL),2), "-", round(max(xdata$NTL),2),")"), 
+             PTL = paste0(round(median(xdata$PTL),2), " (", round(min(xdata$PTL),2), "-", round(max(xdata$PTL),2),")"),
+             CL = paste0(round(median(xdata$CL),2), " (", round(min(xdata$CL),2), "-", round(max(xdata$CL),2),")"), 
+             SO4 = paste0(round(median(xdata$SO4),2), " (", round(min(xdata$SO4),2), "-", round(max(xdata$SO4),2),")"),
+             RPDI = paste0(round(median(xdata$W1_HALL),2), " (", round(min(xdata$W1_HALL),2), "-", round(max(xdata$W1_HALL),2),")"),
+             SUBD = paste0(round(median(xdata$LSUB_DMM),2), " (", round(min(xdata$LSUB_DMM),2), "-", round(max(xdata$LSUB_DMM),2),")"),
+             TPRCP = paste0(round(median(xdata$PSUMPY_XXXX_PT),2), " (", round(min(xdata$PSUMPY_XXXX_PT),2), "-", round(max(xdata$PSUMPY_XXXX_PT),2),")"),
+             MAST = paste0(round(median(xdata$TMEAN_S_XXXX_PT),2), " (", round(min(xdata$TMEAN_S_XXXX_PT),2), "-", round(max(xdata$TMEAN_S_XXXX_PT),2),")"))
+  
+  sumtbl <- rbind(sumtbl,tmp)
+}
+
+sum(sumtbl$site)
+```
+
+```{r}
+write.csv(sumtbl,"Figures/Table_1_ModelSummary.csv")
+```
+
+# Create Ecoregion Map
+
+```{r}
+library(tmap)
+library(sf)
+
+maps <- read_sf("Data_Raw/Ag_Ecoregions9_20121005.shp")
+maps$ecoregion <- maps$WSA_9
+pts <- read.csv("Present_Day_Environmental_Data.csv")
+pts <- st_as_sf(pts,coords = c("LON_DD", "LAT_DD"), crs = 4269)
+
+colorPalReg <- RColorBrewer::brewer.pal(9, "Set1")
+
+Ecoregions <- tm_shape(maps)+
+  tm_fill(fill="ecoregion", 
+          fill.scale = tm_scale_categorical(values = colorPalReg),
+          fill.legend = tm_legend(title = "Ecoregion",
+                                  orientation = "portrait"))+
+  # add 2018-2019 sampling points
+  tm_shape(pts)+
+  tm_dots()+
+  tm_graticules()+
+  tm_layout(legend.text.size = 0.75, 
+            legend.title.size = 1,
+            legend.bg.color = "white",
+            legend.position = c(1,0.85),
+            frame = FALSE, 
+            outer.margins = c(0.1,0.15,0.1,0.15))
+  
+  
+tmap_save(filename = "Figures/Figure1_EcoregionMap_V7.jpeg", 
+          Ecoregions, height = 7, width = 11, units = "in")
+```
+
+# Assemblage-Level Evaluation of JSDM
+
+These models were fitted using same procedure as Kopp et al. 2023 except we did not include traits information. We assess assemblage level predictions.
+
+## Observed vs predicted richness regression
+
+Adding thresholds to exclude rare taxa solves model over prediction. This is consistent with van Sickle et al (2007). Rare taxa could be systematically missed during subsampling processing. For alpha and beta parameters we select threshold that corresponded to smallest P-value of the estimate occurring outside the intercept or slope cutoffs recommended by Linke et al (2005).
+
+```{r}
+OE_out <- data.frame()
+plotdata <- data.frame()
+threshold <- c(0, 0.05, 0.1, 0.15, "spFreq")
+ 
+for(mn in modelnames){
+  # mn <- modelnames[5]
+  print(mn)
+  ROI <- unlist(lapply(strsplit(mn, "_"), "[", 3))
+
+  #load model 
+  load(paste0(FittedModelPath, "/", mn)) #model.env
+  YData <- model.env$Y
+  
+  # Compute predicted value
+  PV <- computePredictedValues(model.env, expected = T)
+  PV <- abind::abind(PV, along = 3)
+
+  for (th in threshold){
+    obs <- apply(YData, 1, sum)
+    
+    if(th=="spFreq"){
+      
+      predFreq <- colMeans(YData[,])
+      preds<-data.frame()
+      for (r in rownames(YData)){
+        #r <- rownames(YData)[1]
+        #x<-PV[r, ,1]
+        
+        preds.tmp <- apply(PV[r, , ], 2, 
+                         function(x){sum(x[x>=predFreq[names(x)]])})
+        preds.tmp <- data.frame(row.names = r,t(preds.tmp))
+        preds <- rbind(preds, preds.tmp)
+      }
+    } else {
+      #th = "0.05"
+      th = as.numeric(th)
+      #Predicted site richness for each slice using threhold
+      preds <- (apply(PV, c(1, 3), function(x) sum(x[x>th])))
+    }
+    all(rownames(preds)==names(obs))
+    tmp <- data.frame(obs, pred = apply(preds, 1, mean), th, ROI)
+
+    lm.mods <- apply(preds, 2, function(x) lm(obs ~ x))
+  
+  
+    parms <- do.call(rbind, lapply(lm.mods, function(x) data.frame(
+      alpha = x$coefficients["(Intercept)"], 
+      beta = x$coefficients["x"], 
+      rsq = summary(x)$r.squared)))
+  
+    p.alpha <- mean(parms$alpha > 1.5 | parms$alpha < -1.5)
+    p.beta <- mean(parms$beta > 1.15 | parms$beta < 0.85)
+
+    parms <- apply(parms, 2, quantile, probs = c(0.05,0.5,0.95))
+
+    OE.PV <- data.frame(region = ROI,
+                        level = "Site",
+                        th,
+                        alpha = parms[,"alpha"],
+                        p.alpha,
+                        beta = parms[,"beta"],
+                        p.beta,
+                        rsq = parms[,"rsq"])
+  
+    OE_out <- rbind(OE.PV, OE_out)
+    plotdata <- rbind(plotdata, tmp)
+  }
+}
+
+```
+
+## Compositional similarity between observed and predicted assemblages.
+
+Probabilistic jaccard was adapted from Scherrer et al 2019. Avoids some of the issues with using presence/absence thresholding
+
+```{r}
+#modified from Scherrer et al 2019
+probabilisticJaccard <- function(obs, pred, th){
+  temp.df <- data.frame(obs, pred)
+    temp.df <- temp.df[order(-temp.df$pred),]
+    AnB <- sum(temp.df$pred[temp.df$obs==1])
+    minP <- min(temp.df$pred[temp.df$obs==1])
+    AuB <- sum(temp.df$pred[temp.df$pred >= minP])
+    return(AnB/AuB)
+ }
+
+P.threshold <- read.csv("Figures/Table3_jsdmPerformance.csv", 
+                        row.names = "Row.names")
+
+
+jaccard_out <- data.frame()
+for(mn in modelnames){
+  # mn <- modelnames[1]
+  print(mn)
+  ROI <- unlist(lapply(strsplit(mn, "_"), "[", 3))
+  th <- P.threshold[ROI,"th"]
+  
+  #load model 
+  load(paste0(FittedModelPath, "/", mn)) #model.env
+  YData <- model.env$Y
+  
+  # Compute predicted value
+  PV <- computePredictedValues(model.env, expected = T)
+  PV <- abind::abind(PV, along = 3)
+  
+  pred <- PV
+  obs <- YData
+  pred <- apply(pred,c(1,2),mean)
+
+  names.abv.th <- apply(pred,1,function(x) names(x)[x>th])
+  
+  out <- data.frame(matrix(NA, nrow(obs), 1))
+  for (i in 1:length(names.abv.th)){
+
+    if(sum(obs[i,names.abv.th[[i]]])==0){
+      jP <- NA
+    } else {
+      jP <- probabilisticJaccard(obs = obs[i, names.abv.th[[i]]],
+                                 pred = pred[i, names.abv.th[[i]]])
+    }
+    out[i,"jP"] <- jP
+  }
+  
+   J.sim <- data.frame(region = ROI,
+                      level = "Site",
+                      name = rownames(YData), 
+                      Type = "jaccard.adj", 
+                      value  = out[,"jP"])
+   
+  jaccard_out <- rbind(J.sim, jaccard_out)
+}
+```
+
+## Posterior predictive checks for richness
+
+```{r}
+P.threshold <- read.csv("Figures/Table3_jsdmPerformance.csv", 
+                        row.names = "Row.names")
+InPost.prop<-data.frame()
+for(mn in modelnames){
+  # mn <- modelnames[5]
+  print(mn)
+
+  r <- unlist(lapply(strsplit(mn, "_"), "[", 3))
+  load(paste0(FittedModelPath, "/",  mn))
+
+  # read in present day data 
+  Xdata.PD <- model.env$XData
+    
+  # update gradient g to hindcast value
+  # Xdata.PD <- NewPredDat[rownames(Xdata.PD), ]
+  Xdata.PD <- Xdata.PD[complete.cases(Xdata.PD), ]
+    
+  # below data is generated using the same process outlined in the     function, Assess.Rich
+  hM = model.env; 
+  NewData = Xdata.PD; 
+  Region = r; 
+  threshold = P.threshold[r,"th"]
+
+  # matching rownames
+  rn <- intersect(rownames(hM$XData), rownames(NewData))
+  grads <- hM$covNames[-1]
+
+  # predicted values for present day conditions
+  PV <- computePredictedValues(hM, expected = T)
+  PV <- abind::abind(PV, along = 3)
+
+  # Ensures rows match between predictions
+  PV <- PV[rn,,]
+  obs <- rowSums(hM$Y[rn,])
+  
+  # Calculate total richness under two scenarios
+  TotalRich.PD <- apply(PV, c(1, 3), function(x){
+    sum(x[x>threshold])})
+  
+  # Determine whether observed values is within the posterior distribution
+  ObsProb <- data.frame()
+  for(i in rn){
+    #i <- rn[3]
+    prob <- data.frame(ObsProb = mean(obs[i] > TotalRich.PD[i,]))
+    ObsProb <- rbind(ObsProb, prob)
+  }
+  
+
+InPost <- 1 - mean(ObsProb$ObsProb==1 | ObsProb$ObsProb==0)
+InPost.prop <- rbind(InPost.prop, data.frame(r, InPost = round(InPost,2)))
+}
+```
+
+## Summarize JSDM performance metrics
+
+Table 2 --- JSDM assemblage-level performance
+
+```{r}
+means <- OE_out
+means$quant <- substring(rownames(OE_out), 1, 2)
+means <- Reduce(function(x, y) 
+  merge(x, y, by = c("region", "th")), 
+  list(
+    reshape2::dcast(region + th + p.alpha + p.beta ~ quant, 
+                    data = means, value.var = "alpha"),
+    reshape2::dcast(region + th ~ quant, 
+                    data = means, value.var = "beta"),
+    reshape2::dcast(region + th ~ quant, 
+                    data = means, value.var = "rsq")
+         ))
+
+oeRegression <- tapply(1:nrow(means), 
+                       means$region, 
+                       function(x){ 
+                         minval <- means[x,]
+                         z <- minval[which.min(minval[,"p.alpha"]),]
+                         return(z)
+                         })
+
+oeRegression <- do.call(rbind, oeRegression)
+oeRegression$th<-as.numeric(oeRegression$th)
+oeRegression <- t(apply(oeRegression[-c(1)], 1, round, 2))
+
+oeRegression <- data.frame(
+  oeRegression[,c("th","p.alpha","p.beta")],
+  alpha = paste0(
+    oeRegression[,"50.x"], 
+    " (", oeRegression[,"5%.x"], 
+    " - ", oeRegression[,"95.x"],")"),
+  beta = paste0(oeRegression[,"50.y"], 
+                " (", oeRegression[,"5%.y"], 
+                " - ", oeRegression[,"95.y"],")"),
+  r2 = paste0(oeRegression[,"50"], 
+              " (", oeRegression[,"5%"], 
+              " - ", oeRegression[,"95"],")")
+  )
+
+
+#similarity table
+JacSim <- tapply(jaccard_out$value, 
+                 jaccard_out$region,
+                 function(x){
+                   round(quantile(x, 
+                                  probs = c(0.05, 0.5, 0.95), 
+                                  na.rm =T),2)})
+JacSim <- do.call(rbind, JacSim)
+JacSim <- data.frame(Region = rownames(JacSim),
+                     JacSim = paste0(JacSim[,"50%"], 
+                                     " (", 
+                                     JacSim[,"5%"], 
+                                     " - ", 
+                                     JacSim[,"95%"],
+                                     ")"))
+
+
+jsdmPerformance <- merge(oeRegression, JacSim, by.x = 0, by.y = "Region")
+
+```
+
+Save JSDM Performance table
+
+```{r}
+#write.csv(jsdmPerformance, "Figures/Table3_jsdmPerformance.csv")
+```
+
+## Posterior predictive check with revisit data
+
+between site visits, there are a number of pheonomena that could influence the presence or absence of a taxon beyond changes in environmental conditions. This includes emergence, colonization (e.g. mass effects) or differences resulting from labratory sub-sampling procedures. Because the model does not account for these differences, Thus we evaluate performance for visit 2 data using taxa that were either present or absent in both sampling periods
+
+```{r}
+FittedModelPath <- "Model_Fit_JSDM_Final"
+modelnames <- grep("1819", 
+                   list.files(FittedModelPath, 
+                              full.names = F, 
+                              recursive = F), 
+                   value = T)
+# thresholds used for model fitting to remove taxa with 
+# rare predicted occurrence probabilities
+P.threshold <- read.csv("Figures/Table3_jsdmPerformance.csv", 
+                        row.names = "Row.names")
+
+par(mfrow = c(3,3))
+post.check <- data.frame()
+df.plot <- data.frame()
+for (i in 1:9){
+  # i <- 6
+  
+  #read in model and data
+  mn <- modelnames[i]
+  load(paste0(FittedModelPath, "/", mn)) # model.env
+  roi <- unlist(lapply(strsplit(mn, "_"), "[", 3))
+  
+  sites.val <- read.csv(paste0("Model_Fit_JSDM_Final/", 
+                               roi, "/Model_Data/ValSites_", 
+                               roi, ".csv"))
+  sites <- read.csv(paste0("Model_Fit_JSDM_Final/", 
+                           roi, "/Model_Data/Sites_", 
+                           roi, ".csv"))
+  
+  #Identifies visit 2 sites 
+  newIDS <- sites[sites$UNIQUE_ID %in% sites.val$UNIQUE_ID, 
+                  c("UNIQUE_ID","UID")]
+  NewData <- sites.val
+  NewData <-  merge(NewData, newIDS, by = "UNIQUE_ID")
+  rownames(NewData) <- NewData$UID.y
+  
+  #identifies visit 2 taxa
+  taxon.val <- read.csv(paste0("Model_Fit_JSDM_Final/", 
+                               roi, "/Model_Data/ValTaxa_", 
+                               roi, ".csv"), 
+                        row.names = "X")
+  obs <- taxon.val[as.character(NewData$UID.x),]
+  obs <- obs[,colnames(obs)[colSums(obs)>0]]
+  
+  # add columns for taxa that were collected 
+  # during visit 1 but not visit during visit 2
+  absentTaxa <- colnames(
+    model.env$Y)[!colnames(model.env$Y) %in% colnames(obs)]
+  
+  if(length(absentTaxa)>0){
+    absentTaxa <- setNames(
+      data.frame(matrix(
+        0, nrow=nrow(obs), 
+        ncol=length(absentTaxa))), 
+      absentTaxa)
+    obs <- cbind(obs, absentTaxa)
+  }
+  
+  # select species that were modeled
+  obs <- obs[,colnames(model.env$Y)]
+  yc <- obs
+  
+  # set all rownames for indexing/site matching
+  yc <- yc[as.character(NewData$UID.x),]
+  rownames(yc) <- NewData$UID.y
+  rownames(obs) <- NewData$UID.y
+
+  # if a taxon was collected during visit 1 but 
+  # NOT visit 2 treat it as known absent 
+  a <- yc[rownames(yc), colnames(model.env$Y)] < 
+    model.env$Y[rownames(yc), colnames(model.env$Y)]
+  a <- ifelse(a, 0, 1)
+  
+  # if a taxon was collected during visit 2 but 
+  # NOT visit 1 treat it as known present
+  p <- yc[rownames(yc), colnames(model.env$Y)] > 
+    model.env$Y[rownames(yc), colnames(model.env$Y)]
+  p <- ifelse(p, 1, 0)
+  
+  # we are interested in predicting the occurrence probabilities 
+  # for taxa that were either present or absent during both visits
+  taxa2pred <- yc[rownames(yc), colnames(model.env$Y)]==  
+    model.env$Y[rownames(yc), colnames(model.env$Y)] 
+  taxa2pred <- ifelse(taxa2pred, NA, 9999)
+  
+  d <- taxa2pred * a * p
+  d[d == 9999] <- 1
+  yc <- d
+
+  # Make predictions to new data
+  NewData <- NewData[,colnames(model.env$XData)]
+  sample.id = as.factor(rownames(NewData))
+  studyDesign = data.frame(sample = sample.id)
+  rL = HmscRandomLevel(units = studyDesign$sample)
+  
+  PVHC <- predict(model.env,
+                  XData = NewData,
+                  studyDesign = studyDesign, 
+                  rL = rL, 
+                  expected = T, 
+                  Yc = yc)
+  
+  PVHC = abind::abind(PVHC, along = 3)
+  
+  pred <- apply(PVHC,c(1,2), sum)
+  out <- data.frame(matrix(NA, nrow(obs), 1))
+  
+  for (q in 1:nrow(pred)){
+    if(sum(obs[q, colnames(yc)[!is.na(yc[q,])]])==0){
+      jP <- NA
+    } else {
+      nams <- colnames(yc)[!is.na(yc[q,])]
+      jP <- probabilisticJaccard(obs = unlist(obs[q, nams]),
+                                 pred = pred[q, nams])
+    }
+    out[q,"jP"] <- jP
+  }
+  
+  
+  # sum occurrence probabilities give appropriate threhsholds
+  focal.taxa.richness.pred <- data.frame()
+  for (r in rownames(yc)){
+    
+    pth <- P.threshold[roi, "th"]
+    focal.taxa.richness.tmp <- apply(
+      PVHC[r, , ], 2,
+      function(x){sum(x[x>pth])})
+    
+    focal.taxa.richness.tmp <- data.frame(
+      t(focal.taxa.richness.tmp), row.names = r)
+    focal.taxa.richness.pred <- rbind(focal.taxa.richness.pred, 
+                                      focal.taxa.richness.tmp)
+  }
+  
+  # sum observed richness
+  focal.taxa.richness.obs <- data.frame()
+  for (r in rownames(yc)){
+    #r <- rownames(yc)[1]
+    focal.taxa.richness.tmp <- data.frame(
+      obs.sum = sum(obs[r, ]),
+      row.names = r, 
+      P = sum(yc[r,],na.rm=T))
+    focal.taxa.richness.obs <- rbind(
+      focal.taxa.richness.obs, 
+      focal.taxa.richness.tmp)
+  }
+  
+  # Summarize posterior distribution
+  pred.mean <- apply(focal.taxa.richness.pred, 1, mean)
+  pred.lwr <- apply(focal.taxa.richness.pred, 
+                    1, quantile, probs = 0.0001)
+  pred.upr <- apply(focal.taxa.richness.pred,
+                    1, quantile, probs = 0.9999)
+  
+  df.tmp <- data.frame(
+    roi, 
+    pred.mean, 
+    pred.lwr, 
+    pred.upr,
+    obs.sum = focal.taxa.richness.obs[names(pred.mean),]) 
+  
+  df.plot <- rbind(df.plot, df.tmp)
+  
+  # check whether observed values is 
+  # within posterior distribution
+  outside <- NULL
+  for (j in 1:dim(focal.taxa.richness.obs)[1]){
+    #j<-1
+    if(focal.taxa.richness.obs[j,"obs.sum"] < 
+       min(focal.taxa.richness.pred[j,]) | 
+       focal.taxa.richness.obs[j,"obs.sum"] > 
+       max(focal.taxa.richness.pred[j,])){
+      outside <- append(outside, 1,  length(outside))
+    } else {
+      outside <- append(outside, 0,  length(outside))
+    }
+  }
+  
+  post.check <- rbind(
+    post.check,
+    data.frame(roi, 
+               n = dim(focal.taxa.richness.obs)[1], 
+               withinPost = round(1-mean(outside),2),
+               value = t(data.frame(
+                 round(quantile(out[,"jP"],
+                        probs=c(0.05,0.5,0.95), 
+                        na.rm = T),2)))))
+}
+rownames(post.check)<-NULL
+print(post.check)
+```
+
+```{r}
+write.csv(post.check, "Figures/Table3_jsdmPerformance_Revisit.csv")
+```
+
+# Random Forest Modeling
+
+Random forest models were used to relate present-day physiochemical conditions to natural and anthropogenic variables.
+
+```{r}
+files <- list.files("Model_Fit_RF_Final/",  full.names = T)
+optimize_rf <- grep("RF_optimize_2b", files, value = T)
+```
+
+## Create model diagnostics table
+
+Displays performance metrics for fitted random forest models.
+
+```{r}
+library(quantregForest)
+
+tbl <- data.frame()
+for (i in 1:length(optimize_rf)){
+  # i <- 4
+
+  # loads rf_model_list
+  load(optimize_rf[i])  
+  rf_mod <- rf_model_list[["qrf"]]
+  
+  response <- unlist(lapply(strsplit(optimize_rf[i], "/"), "[[", 2))
+  response <- unlist(lapply(strsplit(response, "_"), "[[", 1))
+  resp.nm <- response 
+  
+  # needed to change this for plotting
+  if(response == "LSUB"){response <- paste0(response, "_DMM")}
+  
+  # make predictions for training data
+  train.x <- rf_mod$predicted
+  train.y <- rf_model_list[["train"]][,response]
+  
+  # diagnostics for training data 
+  #TrainRsq <- round(tail(rf_mod$rsq, 1),2)
+  TrainRsq <- round(cor(train.x, train.y) ^ 2,2)
+  TrainRMSE <- round(sqrt(tail(rf_mod$mse,1)),2)
+  
+  # make predictions for testing data 
+  test.x <- predict(rf_mod, newdata = rf_model_list[["test"]], 
+                    what = c(0.05, 0.5, 0.95))
+  test.y <- rf_model_list[["test"]][,response]
+  
+  # diagnostics for testing data
+  
+  #TestRsq <- round(1 - (sum((test.y - test.x[,2])^2)/
+   #                       sum((test.y - mean(test.y))^2)), 2) 
+  TestRsq <- round(cor(test.x[,2], test.y) ^ 2, 2)
+  TestRMSE <- round(sqrt(mean((test.y - test.x[,2])^2)),2)
+  
+  # store results
+  tbl <- rbind(tbl, data.frame(response, 
+                      rf_mod$ntree, rf_mod$mtry, 
+                      TestData = nrow(rf_model_list[["test"]]), 
+                      TrainData = length(train.y),
+                      #ValidData = nrow(NewData),
+                      TrainRsq, TrainRMSE, 
+                      TestRsq, TestRMSE))
+}
+
+```
+
+```{r}
+tbl
+```
+
+Write diagnostics table
+
+```{r}
+write.csv(tbl, "Figures/Table2_RanfomForestModels_Diagnostics_R1.csv")
+```
+
+## Investigate anthropogenic covariates
+
+Identify management variables for each stressor
+
+```{r}
+# manually identify management variables
+# unique(c(varsNTL, varsPTL, varsCL, varsSO4, varsLSUB))
+manage.vars <- c("TMEAN_S_XXXX_PT", "PSUMPY_XXXX_PT",
+                 "PctCropXXXXWs", "RdDensWs", 
+                 "N_inputs", "P_inputs",
+                 "CoalMineDensWs", "MineDensWs", 
+                 "mean.n_tw.2018", "mean.s_tw.2018",
+                 "W1_HAG", "W1_HNOAG", "W1H_CROP",
+                 "PctCropXXXXWsRp100","PctFstWs") 
+
+manage.vars.names <- c("MSAT", "TPRCP", "PctCrop", "RdDens",
+                       "N_input", "P_input", "CoalMineDen", 
+                       "MineDen", "N_dep", "S_dep","W1_HAG",
+                       "W1_HNOAG","W1H_CROP", 
+                       "PctCropRP", "PctNatRP")
+
+manage.vars <- data.frame(manage.vars, manage.vars.names)
+rownames(manage.vars) <- manage.vars[,1]
+```
+
+### Variable Importance table
+
+Display rankings of variables by % increase MSE table includes all variables, another includes only the anthorpogenic variables
+
+```{r}
+# Variable importance table
+varlist <- data.frame()
+
+for (i in c(3,4,1,5,2)){
+  # i <- 3
+  load(optimize_rf[i]) #loads rf_model_list where 
+  rf_model_list$train
+  rf_mod <- rf_model_list[["qrf"]]
+  class(rf_mod) <- "randomForest"
+  response <- unlist(lapply(strsplit(optimize_rf[i], "/"), "[[", 2))
+  response <- unlist(lapply(strsplit(response,"_"), "[[",1))
+  imp <- sort(importance(rf_mod)[,1], decreasing = T)
+  
+  #range
+  mins <- round(apply(rf_model_list$train[,names(imp)], 2, min),2)
+  maxs <- round(apply(rf_model_list$train[,names(imp)], 2, max),2)
+  
+  impvars <- data.frame(response, 
+                        V = names(imp),
+                        value = seq_along(imp), 
+                        mins,maxs)
+
+  varlist <- rbind(varlist, impvars)  
+}
+
+# calculate range of predictor variables
+mn <- reshape2::acast(V ~ response,
+                value.var = "mins", 
+                data = varlist, 
+                fun.aggregate = min, 
+                na.rm = T)
+
+mn <- apply(mn, 1, function(x) min(x))
+
+mx <- reshape2::acast(V ~ response,
+                value.var = "maxs", 
+                data = varlist, 
+                fun.aggregate = max, 
+                na.rm=T)
+mx <- apply(mx, 1, function(x) max(x))
+
+Range <- data.frame(V = names(mx),
+                    Range = paste0(mn,"-", mx))
+
+varlist <- reshape2::dcast(V ~ response, 
+                           data = varlist, 
+                           fill = "0")
+rownames(varlist) <- varlist$V
+ 
+# order variables natural and anthropogenic 
+nm <- c(varlist$V[!varlist$V%in%manage.vars$manage.vars],
+       varlist$V[varlist$V%in%manage.vars$manage.vars])
+
+varlist <- varlist[nm,c("V","NTL","PTL","CL","SO4","LSUB")]
+
+varlist <- merge(varlist, Range, by = c("V"))
+rownames(varlist) <- varlist$V
+varlist <- varlist[nm,]
+```
+
+Save Table S1 and S2
+
+```{r}
+write.csv(varlist, "Figures/RF_Variable_Ranking_ALL_TableS1_R1.csv")
+```
+
+### Partial dependence plots
+
+Compile data for most important anthropogenic predictor variables.
+
+```{r}
+# function needed to place all variables on the same axis
+rescale <- function(x){(x - min(x)) / (max(x) - min(x))}
+
+ParPlotsData <- list() 
+for (i in 1:length(optimize_rf)){
+  # i <- 2
+  print(optimize_rf[i])
+  #loads rf_model_list where 
+  load(optimize_rf[i]) 
+  rf_mod <- rf_model_list[["qrf"]]
+  class(rf_mod) <- "randomForest"
+  rf_train <- rbind(rf_model_list[["train"]],
+                    rf_model_list[["test"]])
+  
+  
+  # modify name to match column names
+  response <- unlist(lapply(strsplit(optimize_rf[i], "/"), "[[", 2))
+  response <- unlist(lapply(strsplit(response, "_"), "[[", 1))
+  if(response == "LSUB"){response <- paste0(response, "_DMM")}
+  
+  # identify and rank anthropogenic variables
+  imp <- sort(importance(rf_mod)[,1], decreasing = T)
+  rnk <- imp[names(imp) %in% manage.vars[,1]]
+  mvs <- manage.vars[names(rnk),]
+  varnum <- ifelse(nrow(mvs) >= 5, 5, nrow(mvs))
+  
+  # top 5 management variables
+  for (mv in 1:varnum){ 
+    #mv<-1
+    a <- partialPlot(x = rf_mod, 
+                     pred.data = rf_train, 
+                     x.var = as.character(mvs[mv,"manage.vars"]), 
+                     plot = F)
+    
+    # back transform all responses to native units
+    if(response %in% c("NTL", "PTL", "CL")){
+      bktrans.Y <- exp(a$y) - 1
+    }
+    
+    if(response %in% c("SO4")){
+      bktrans.Y <- exp(a$y)
+    }
+    
+    #if(response %in% "LSUB_DMM"){
+     # bktrans.Y <- 10^a$y
+    #}
+    bktrans.Y<-a$y
+    # store results 
+    a <- data.frame(do.call(cbind,a),
+                    xvar = mvs[mv, "manage.vars.names"], 
+                    yvar = response, 
+                    minmax.X = rescale(a$x),
+                    bktrans.Y)
+
+    ParPlotsData[[response]][[mvs[mv,"manage.vars"]]] <- a
+  }
+}
+
+# Aggregate output
+tmp <- lapply(ParPlotsData, function(x) do.call(rbind, x))
+tmp <- do.call(rbind,tmp)
+tmp$yvar <- factor(tmp$yvar, 
+                   levels = c("NTL", "PTL", "CL", "SO4", "LSUB_DMM"))
+levels(tmp$yvar)[5] <- "SUBD"
+```
+
+Create Plot partial dependence
+
+```{r}
+library(gridExtra)
+
+colors<-c(RColorBrewer::brewer.pal(12,"Paired"),"gray")
+plotcolors <- data.frame(var = unique(tmp$xvar),
+                         colorName = colors)
+z<-merge(tmp,plotcolors,by.x = "xvar", by.y = "var")
+z<-split(z,z$yvar)
+
+plist <- lapply(z,function(pl){
+#pl<-z[[1]]$colorName
+  ggplot(data = pl, 
+       aes(x = minmax.X, y = bktrans.Y, colour = xvar))+
+  geom_line(lwd = 1.15) +
+  #facet_wrap("yvar", scales = "free", nrow = 1)+
+  ylab(unique(pl$yvar))+
+  xlab("")+
+  scale_x_continuous(breaks = c(0, 0.25, 0.5, 0.75, 1), 
+                     labels = c("low", "", "med", "", "high"))+
+  theme_bw()+
+  theme(legend.position = "bottom")+
+  guides(color=guide_legend(title = "", ncol=1))+
+  #scale_fill_manual(values = pl$colorName)
+  scale_colour_manual(name = "xvar",values = unique(pl$colorName))
+})
+
+#needed to arrange plots and save differently
+#aggangeGrob allows for ggsave() to work properly
+P2 <- do.call("arrangeGrob", c(plist, ncol=length(plist)))
+#grid aggange to view
+do.call("grid.arrange", c(plist, ncol=length(plist)))
+
+```
+
+```{r}
+ggsave(filename = "Figures/Figure_1_RFPartialDependance_r1.jpeg", 
+       P2, height = 4, width = 8, units = "in")
+```
+
+# Evaluating abiotic conditions
+
+We used fitted random forest models to predict physiochemical conditions after removing anthropogenic effects. Most management variables (defined above) are directly related to anthropogenic activities and therefore set to zero. Note worthy exceptions were the climate variables, which were set to 1900-1950 averages, Nitrogen deposition which was set to constant deposition of 5kg/ha and sulfur deposition which was set to \<1.65 (See discussion in Clark et al. 2018).
+
+## Test for extrapolation
+
+Function is based based off Yuan et al. (2024). Originally developed by Meyer and Pebesma (2021). To test whether hindcasted predictor variables are within the domain (sufficiently similar) to the training data
+
+```{r}
+library(vegan)
+# Test for extrapolation
+TestExtrapolation <- function(TrainData = tData, 
+                              NewData = nData, 
+                              wt = wt){
+  
+  # Scale and Weight predictor variables in training data
+  train_scale_data <- scale(TrainData)
+  train_center <- attr(train_scale_data, "scaled:center")
+  train_scale <- attr(train_scale_data, "scaled:scale")
+  
+  train_scale_data_wt <- t(
+    apply(train_scale_data, 1, 
+          function(x) x * wt))
+  
+  # scale and weight new data
+  new_scale_data <- scale(NewData, 
+                          center = train_center, 
+                          scale = train_scale)
+  new_scale_data_wt <- t(apply(new_scale_data, 1, 
+                               function(x) x * wt))
+  
+  #rbind all data to calc distance
+  all_data <- rbind(new_scale_data_wt, train_scale_data_wt)
+  nDataIndex <- 1:nrow(new_scale_data_wt)
+  tDataIndex <- (max(nDataIndex)+1):nrow(all_data)
+  
+  # calculate dissimilarity index for all data
+  d <- vegdist(all_data, method = "euclidean")
+  d <- as.matrix(d)
+  
+  # calculate mean distance training data 
+  trainMean <- mean(d[tDataIndex, tDataIndex])
+  # calculate threshold 
+  tData_DI <- apply(d[tDataIndex, tDataIndex], 1, 
+                    function(x) round(min(x[x != 0])/trainMean,3))
+  
+  # threshold is the upper whisker of the boxplot
+  threshold <- boxplot(tData_DI, plot=F)$stats[5,1]
+  # calculate min distance from new data to training data
+  nData_DI <- apply(
+    d[nDataIndex,tDataIndex], 1, 
+    function(x) round(min(x[x!=0])/trainMean,3))
+  
+  return(list(MeanDistTrain = trainMean, 
+              Threshold = threshold,
+              NewDataD_ = nData_DI))
+}
+```
+
+Calculate proportion of sites that could be susceptible to extrapolation
+
+```{r}
+pd <- read.csv("Present_Day_Environmental_Data.csv")
+rownames(pd) <- pd$UID
+nd <- read.csv("Model_Fit_RF_Final/NoHumanPrediction_r1.csv")
+rownames(nd) <- nd$UID
+
+files <- list.files("Model_Fit_RF_Final/",  full.names = T)
+optimize_rf <- grep("RF_optimize_2b", files, value = T)
+results <- list()
+
+for (rf in optimize_rf){
+  #rf <- optimize_rf[1]
+  load(rf)
+  nm <- unlist(lapply(strsplit(rf,"/"),"[[",2))
+  nm <- unlist(lapply(strsplit(nm,"_"),"[[",1))
+  
+  imp <- importance(rf_model_list$qrf)
+  wt <- imp[,1]/sum(imp[,1])
+  
+  nData <- nd[,names(wt)]
+  nData <- nData[complete.cases(nData),]
+  
+  tData <- rf_model_list$train[ ,names(wt)]
+  
+  ETest <- TestExtrapolation(TrainData = tData, 
+                              NewData = nData, 
+                              wt = wt)
+  
+  results[[rf]] <- setNames(data.frame(ETest$NewDataD_, 
+                            flag = ETest$NewDataD_ > ETest$Threshold,
+                            UID = names(ETest$NewDataD_)),
+                            c(paste0(nm,"_DI"), 
+                              paste0(nm,"_Flag"), "UID"))
+}
+
+ExtrapResults <- Reduce(function(x, y) 
+  merge(x, y, by="UID", all = T), results)
+#threshold used by Yuan et al. 2024
+ExtrapResults[, "CL_Flag"] <- ifelse(ExtrapResults$CL_DI >0.5, 
+                                     TRUE,FALSE)
+ExtrapResults[, "SO4_Flag"]<-ifelse(ExtrapResults$SO4_DI>0.5, 
+                                    TRUE,FALSE)
+ExtrapResults[, "NTL_Flag"]<-ifelse(ExtrapResults$NTL_DI>0.5,
+                                    TRUE,FALSE)
+ExtrapResults[, "PTL_Flag"]<-ifelse(ExtrapResults$PTL_DI>0.5, 
+                                    TRUE,FALSE)
+ExtrapResults[, "LSUB_Flag"] <-ifelse(ExtrapResults$LSUB_DI>0.5,
+                                      TRUE,FALSE)
+
+ExtrapResults$Any_Flag <- apply(
+  ExtrapResults[,grep("_DI", names(ExtrapResults))], 1, 
+  function(x) any(x[!is.na(x)] > 0.5))
+
+ExtrapResults <- merge(
+  ExtrapResults, 
+  nd[,c("UID","AG_ECO9","LON_DD",
+        "LAT_DD","WGT_TP_CORE")], 
+  all.x = T)
+
+#proportion of sites within each ecoregion that could be at risk for extrapolation
+tapply(ExtrapResults$Any_Flag, ExtrapResults$AG_ECO9, function(x) round(mean(x),2))
+mean(ExtrapResults$Any_Flag)
+```
+
+Create map of locations.
+
+```{r}
+library(tmap)
+maps <- read_sf("Data_Raw/Ag_Ecoregions9_20121005.shp")
+maps$ecoregion <- maps$WSA_9
+
+ER_sf <- reshape2::melt(
+  ExtrapResults[,c("UID", "AG_ECO9", "LON_DD", "LAT_DD", 
+                   grep("Flag", names(ExtrapResults), 
+                        value = T))], 
+  id.vars = c("UID","AG_ECO9", "LON_DD", "LAT_DD"), 
+  value.name = "Extrapolation")
+
+ER_sf <- st_as_sf(ER_sf, 
+                  coords = c("LON_DD", "LAT_DD"), 
+                  crs = 4269)
+ER_sf_Evaluated <- ER_sf[!ER_sf$Extrapolation & 
+                           !is.na(ER_sf$Extrapolation),]
+ER_sf <- ER_sf[ER_sf$Extrapolation & 
+                 !is.na(ER_sf$Extrapolation),]
+ER_sf$variable <- factor(
+  as.character(ER_sf$variable), 
+  levels =c("NTL_Flag", "PTL_Flag", "CL_Flag",
+            "SO4_Flag","LSUB_Flag", "Any_Flag") )
+
+ExtrapMap <- tm_shape(maps) +
+  tm_borders() +
+  tm_shape(ER_sf) +
+  tm_symbols(fill.scale = tm_scale_categorical(
+    values = "Extrapolation"),
+    col = "blue",
+    size = 0.5) +
+  tm_facets(by = "variable", 
+            nrow = 2 , 
+            free.coords = F)+
+  tm_layout(legend.show = F)
+
+rmFlaggedSites <- ExtrapResults[ExtrapResults$Any_Flag, "UID"]
+length(rmFlaggedSites)
+```
+
+```{r}
+tmap_save(filename = "Figures/FigureXX_ExtrapMap_Supplemental.jpeg",
+          ExtrapMap, height = 5, width = 11, units = "in")
+```
+
+## Create biplot of observed and hindcast estimates
+
+Load Packages and Data
+
+```{r}
+library(ggplot2)
+library(tmap)
+library(sf)
+library(dplyr)
+library(cowplot)
+library(reshape2)
+library(scales)
+
+newJSDMpreds <- read.csv("Hindcast_Environmental_Data_r1.csv", 
+                         row.names = "X")
+newJSDMpreds <- newJSDMpreds[!is.na(newJSDMpreds$HC),]
+newJSDMpreds$titles <- factor(newJSDMpreds$titles, 
+                              levels = c("NTL", "PTL", 
+                                         "CL", "SO4",
+                                         "SUBD","RPDI",
+                                         "MSAT","TPRCP")) 
+#remove Extrapolated Points
+newJSDMpreds<-newJSDMpreds[!newJSDMpreds$UID%in%rmFlaggedSites,]
+```
+
+Calculate regional mean and quantiles to summarize regional patterns. JSDM and Random Forest Models were fitted with transformed values. For visualization, values were backtransformed to native units
+
+```{r}
+# calculate calculate 10th and 90th percentiles for each region 
+means <- newJSDMpreds %>%
+  group_by(Ecoregion, titles) %>%
+  summarise(PD.mean = quantile(PD.bktrans, probs = 0.5), 
+            PD.upr = quantile(PD.bktrans, probs = 0.90),
+            PD.lwr = quantile(PD.bktrans, probs = 0.10),
+            HC.mean = quantile(HC.bktrans, probs = 0.5), 
+            HC.upr = quantile(HC.bktrans, probs = 0.90),
+            HC.lwr = quantile(HC.bktrans, probs = 0.10),
+            .groups = 'drop') %>% 
+  mutate(Exceed = NA) 
+```
+
+Assemble plots as list. Couldnt used facet wrap because scales were different. RPDI and MAST were potted on untransformed axes
+
+```{r}
+options(scipen = 999)
+colorPalReg <- RColorBrewer::brewer.pal(9,"Set1")
+plotlist <- list()
+for (i in levels(means$titles)){
+  #i<-"RPDI"means$titles[6]
+  
+  # Select each variable for plotting
+  df <- newJSDMpreds[newJSDMpreds$titles == i & 
+                        newJSDMpreds$PD.bktrans > 0 & 
+                        newJSDMpreds$HC.bktrans > 0, ]
+  df2 <- means[means$titles == i, ]  
+  
+  # RPDI and MSAT were not plotted on log scale axes
+  if(!i %in% c("RPDI", "MSAT")){
+    
+   plotlist[[i]] <- ggplot(df2, 
+                           aes(x = HC.mean,
+                               y = PD.mean)) +
+    geom_point(aes(color = Ecoregion), 
+               size = 3)+
+    geom_abline(slope = 1, intercept = 0, lty = 2) +
+    geom_errorbar(data = df2, 
+                  aes(ymin = PD.lwr, 
+                      ymax = PD.upr, 
+                      x = HC.mean,
+                      y = PD.mean), 
+                  width = 0.0, 
+                  show.legend = F)+
+    geom_errorbar(data = df2, 
+                  aes(xmin = HC.lwr, 
+                      xmax = HC.upr,
+                      x = HC.mean,
+                      y = PD.mean), 
+                  width = 0.0, show.legend = F)+
+    geom_point(data = df2, 
+               aes(x = HC.mean, 
+                   y = PD.mean, 
+                   color = Ecoregion, 
+                   size = 0.1), size = 3,
+               show.legend = F)+
+    geom_point(data = df2, 
+               aes(x = HC.mean, 
+                   y = PD.mean, 
+                   color = Ecoregion),size = 3,
+               shape = 1, 
+               colour = "black",
+               show.legend = F)+
+    scale_y_continuous(trans = 'log10') +
+    scale_x_continuous(trans = 'log10') +
+    xlab("") +
+    ylab("") +
+    labs(title = i)+
+    theme_bw() +
+    scale_shape_manual(values = c(1, 19) , guide = "none")+
+    scale_colour_manual(values = colorPalReg) +
+    theme(axis.text.x = element_text(angle = 90, 
+                                     vjust = 0.5, 
+                                     hjust=1, size = 12), 
+          axis.text.y = element_text(size = 12),
+          legend.position = "none",
+          #note for margin: t = 0, r = 0, b = 0, l = 0, unit = "pt"
+          plot.margin = unit(c(0.05, 0.05, 0.05, 0.05),"inches"))
+   
+  } else {
+    if(i == c("MSAT")){
+      plotlist[[i]] <- ggplot(df2,
+                          aes(x = HC.mean, 
+                              y = PD.mean)) +
+    geom_point(aes(color = Ecoregion), size = 3) +
+    geom_abline(slope = 1, intercept = 0, lty = 2) +
+    geom_errorbar(data = df2, 
+                  aes(ymin = PD.lwr, 
+                      ymax = PD.upr, 
+                      x = HC.mean,
+                      y = PD.mean), 
+                  width = 0.0, 
+                  show.legend = F)+
+    geom_errorbar(data = df2, 
+                  aes(xmin = HC.lwr, 
+                      xmax = HC.upr,
+                      x = HC.mean,
+                      y = PD.mean), 
+                  width = 0.0, show.legend = F)+
+    geom_point(data = df2, 
+               aes(x = HC.mean, 
+                   y = PD.mean, 
+                   color = Ecoregion), size = 3,
+               show.legend = F)+
+    geom_point(data = df2, 
+               aes(x = HC.mean, 
+                   y = PD.mean, 
+                   color = Ecoregion),size = 3,
+               shape = 1, 
+               colour = "black",
+               show.legend = F)+
+    xlab("") +
+    ylab("") +
+    labs(title = i) +
+    theme_bw() +
+    scale_shape_manual(values = c(1, 19), 
+                       guide = "none")+
+    scale_colour_manual(values = colorPalReg)+
+    theme(axis.text.x = element_text(angle = 90, 
+                                     vjust = 0.5, 
+                                     hjust=1, size = 12), 
+          axis.text.y = element_text(size = 12),
+          legend.position = "none",
+          plot.margin = unit(c(0.05, 0.05, 0.05, 0.05),"inches"))
+    }
+  }
+  
+  if(i == c("RPDI")){
+    plotlist[[i]] <- ggplot(df2,
+                          aes(x = Ecoregion, 
+                              y = PD.mean)) +
+    geom_point(aes(color = Ecoregion), size = 3) +
+    geom_abline(slope = 0, intercept = 0.33, lty = 2) +
+    geom_errorbar(data = df2, 
+                  aes(ymin = PD.lwr, 
+                      ymax = PD.upr, 
+                      x = Ecoregion,
+                      y = PD.mean), 
+                  width = 0.0, 
+                  show.legend = F)+
+    geom_point(data = df2, 
+               aes(x = Ecoregion, 
+                   y = PD.mean, 
+                   color = Ecoregion), size = 3,
+               show.legend = F)+
+    geom_point(data = df2, 
+               aes(x = Ecoregion, 
+                   y = PD.mean, 
+                   color = Ecoregion),size = 3,
+               shape = 1, 
+               colour = "black",
+               show.legend = F)+
+    xlab("") +
+    ylab("") +
+    labs(title = i) +
+    theme_bw() +
+    scale_shape_manual(values = c(1, 19), 
+                       guide = "none")+
+    scale_colour_manual(values = colorPalReg)+
+    theme(axis.text.x = element_blank(), 
+          axis.text.y = element_text(size = 12),
+          legend.position = "none",
+          plot.margin = unit(c(0.05, 0.05, 0.05, 0.05),"inches"))
+    }
+  }
+
+
+legend <- ggplot(df2,
+                 aes(x = Ecoregion,
+                     y = PD.mean)) +
+    geom_point(aes(color = Ecoregion), size = 3) +
+    geom_abline(slope = 0, intercept = 0.33, lty = 2) +
+    geom_errorbar(data = df2, 
+                  aes(ymin = PD.lwr, 
+                      ymax = PD.upr, 
+                      x = Ecoregion,
+                      y = PD.mean), 
+                  width = 0.0, 
+                  show.legend = T)+
+    geom_point(data = df2, 
+               aes(x = Ecoregion, 
+                   y = PD.mean, 
+                   color = Ecoregion), size = 3,
+               show.legend = T)+
+    geom_point(data = df2, 
+               aes(x = Ecoregion, 
+                   y = PD.mean, 
+                   color = Ecoregion),size = 3,
+               shape = 1, 
+               colour = "black",
+               show.legend = T)+
+    xlab("") +
+    ylab("") +
+    labs(title = i) +
+    theme_bw() +
+    scale_shape_manual(values = c(1, 19), 
+                       guide = "none")+
+    scale_colour_manual(values = colorPalReg)+
+    #theme(axis.text.x = element_blank(), 
+     #     axis.text.y = element_text(size = 12),
+          #legend.position = "none",
+      #    plot.margin = unit(c(0.05, 0.05, 0.05, 0.05),"inches"))
+    }
+
+# add legend to plot
+legend_b <- cowplot::get_legend(
+  legend) + 
+    guides(
+      color =
+        guide_legend(ncol = 1, 
+                     title.position = "top",
+                     override.aes = list(size = 3)),
+      alpha = guide_legend(override.aes = list(size = 3))) +
+    theme(legend.position = "top", 
+          legend.direction = "vertical", 
+          legend.box = "vertical")
+)
+
+
+#Convert list of plots to grob
+plotlist2 <- lapply(plotlist, as_grob)
+
+#note use of margin here to allow space for labels 
+P3 <- plot_grid(plot_grid(plotlist = plotlist2, 
+                ncol=4, align = "hv"), 
+                plot_grid(NULL, legend_b, ncol=1),
+                 rel_widths=c(1, 0.2), align = "h")#+
+  #theme(plot.margin = ggplot2::margin(0, 0, -100, 0))
+
+#note use of margin here to allow space for labels 
+P3 <- plot_grid(plotlist = plotlist2, 
+                ncol=4, align = "hv")+
+  theme(plot.margin = ggplot2::margin(0, 0, -100, 0))
+
+P3 <- add_sub(P3, "Hindcasted", 
+              x = 0.5, y = 1.5, 
+              vpadding=grid::unit(1, "lines"))
+P3 <- add_sub(P3, "Observed", 
+              x = 0.02, y = 4, 
+              angle = 90, 
+              vpadding=grid::unit(1, "lines"))
+P3 <- plot_grid(P3,
+                legend_b, ncol = 2, 
+                rel_widths = c(1, 0.15), 
+                label_x = "Hindcast")
+P3 <- ggdraw(P3)
+
+P3
+
+```
+
+save plot
+
+```{r}
+ggsave(
+  filename = 
+    "Figures/Figure2_PhysiochemicalConditons_R1.jpeg", 
+       P3, height = 5, width = 11, units = "in")
+```
+
+summary table for writing.
+
+```{r}
+
+means$PD <- paste0(
+  round( means$PD.mean, 2), 
+  " (", 
+  round(means$PD.lwr,2),
+  "-", 
+  round(means$PD.upr,2),
+  ")")
+
+means$HC <- paste0(
+  round(means$HC.mean, 2), 
+  " (", 
+  round(means$HC.lwr,2),
+  "-", 
+  round(means$HC.upr,2), 
+  ")")
+
+melted <- reshape2::melt(
+  means[,c("Ecoregion", "titles", "PD", "HC")], 
+  id.vars = c("Ecoregion", "titles"))
+
+Regonal.Means <- dcast(
+  data = melted,
+  Ecoregion ~ titles + variable, 
+  value.var = "value")
+
+write.csv(Regonal.Means,
+          "Figures/TablS3_RegionalMeans_R1.csv")
+
+```
+
+## Calculate proportion of sites with impaired physiochemical conditions
+
+Following Kilgour and Stanfield (2005), we identified sites that had a difference between present-day and hindcasted values exceed 2 SD. Olson and Hawkins (2013) offered some criticisms regarding prediction intervals generated from the quantile random forest so we did not use this approach. We used the threshold of RPDI
+
+```{r}
+library(spsurvey)
+
+# create matrix of Y/N for exceed
+NewPredDat <- reshape2::dcast(
+  UID + Ecoregion + LAT_DD + LON_DD ~ titles, 
+  data = newJSDMpreds, 
+  value.var = "Exceed")
+
+# append weights to the sites
+pd <- read.csv("Present_Day_Environmental_Data.csv")
+rownames(pd) <- pd$UID
+
+NewPredDat$WGT_TP_CORE <- pd[
+  as.character(NewPredDat$UID),"WGT_TP_CORE"]
+
+EstDat <- NewPredDat[NewPredDat$WGT_TP_CORE>0,]
+
+# calculate error arround estimates
+ca <- cat_analysis(EstDat, 
+                   vars = c("NTL", "PTL", "CL", "SO4", "SUBD",        
+                            "RPDI", "MSAT", "TPRCP"), 
+                   subpops = "Ecoregion", 
+                   weight = "WGT_TP_CORE", 
+                   xcoord = "LON_DD",
+                   ycoord = "LAT_DD")
+ca <- ca[ca$Category == "Y",]
+ca$Indicator <- factor(
+  ca$Indicator, levels = c("NTL", "PTL", "CL", "SO4", "SUBD",
+                                  "RPDI", "MSAT", "TPRCP"))
+
+# make plot
+P6 <- ggplot(ca, aes(x=Subpopulation, y=Estimate.P))+
+  geom_col(aes(fill= Subpopulation), 
+           color = "black", 
+           show.legend = F)+
+  geom_errorbar(aes(ymax =UCB95Pct.P, 
+                    ymin = LCB95Pct.P), 
+                width = 0.2)+
+  facet_wrap("Indicator", nrow = 2) +
+  ylab("Percentage of Streams") +
+  xlab("Region") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, 
+                                   vjust = 0.5, 
+                                   hjust = 1))+
+  guides(fill = guide_legend(title = "Ecoregion"))+
+  scale_fill_manual(values = colorPalReg)
+
+
+# # split dataframe by region and calculate the proportion of sites 
+# # that were identified as impaired
+# sp <- split(NewPredDat, 
+#             NewPredDat$Ecoregion)
+# 
+# sp <- lapply(sp, function(x) 
+#   apply(x[,-c(1:4)], 2, function(y) 
+#     mean(y == "Y", na.rm = T)))
+# 
+# sp <- reshape2::melt(do.call(rbind, sp))
+# names(sp)
+# P6 <- ggplot(sp, aes(x=Var1, y=value))+
+#   geom_col(aes(fill= Var1), 
+#            color = "black", 
+#            show.legend = F)+
+#   facet_wrap("Var2", nrow = 2)+
+#   ylab("Percent of Streams")+
+#   xlab("Region") + 
+#   theme_bw()+
+#   theme(axis.text.x = element_text(angle = 90, 
+#                                    vjust = 0.5, 
+#                                    hjust = 1))+
+#   guides(fill = guide_legend(title = "Ecoregion"))+
+#   scale_fill_manual(values = colorPalReg)
+
+P6
+
+ca[,c("Subpopulation","Indicator",
+      "Estimate.P", "LCB95Pct.P",
+      "UCB95Pct.P")]
+
+```
+
+Save Plot
+
+```{r}
+ggsave(filename = "Figures/Figure3a_PropSitesExceed_r1.jpeg", 
+       P6, height = 3, width = 8, units = "in")
+```
+
+## Map count of disturbances
+
+count the number of impaired gradients at each site
+
+```{r}
+# maps for background layer
+maps <- read_sf("Data_Raw/Ag_Ecoregions9_20121005.shp")
+maps$ecoregion <- maps$WSA_9
+maps <- st_make_valid(maps)
+maps$WSA_9 <-as.character(maps$WSA_9)
+
+# rechape data into matrix to count disturbance
+NewPredDat <- reshape2::dcast(
+  UID + Ecoregion + LAT_DD + LON_DD ~ variable, 
+  data = newJSDMpreds, 
+  value.var = "Exceed")
+
+any(NewPredDat$UID%in%rmFlaggedSites)
+
+# rowsums of site indicating the number of gradients that were impaired
+counts <- apply(
+  NewPredDat[, -c(1:4)], 1, function(y) 
+  sum(y == "Y", na.rm = T))
+counts <- data.frame(
+  NewPredDat[,1:4], counts)
+
+# Create sf file for plot
+mapdata <- st_as_sf(counts, 
+                    coords = c("LON_DD", "LAT_DD"), 
+                    crs = 4269)
+
+# identify sites that did not exceed thresholds for any stressor
+# NoDisturbance <- mapdata[mapdata$counts == 0,]
+# mapdata <- mapdata[mapdata$counts > 0, ]
+
+mapdata$Disturbance <- ifelse(
+  mapdata$counts > 0,
+  "Disturbance Present",
+  "Disturbance Not Detected")
+
+P4 <- tm_shape(maps) +
+  tm_borders()+
+  tm_shape(mapdata)+
+  tm_symbols(fill = "counts",
+             fill.scale =
+               tm_scale_intervals(values = "brewer.yl_or_br"),
+             fill.legend = tm_legend(show = F),
+             size = 0.35,
+             shape = 21,
+             col = "black")+
+  tm_facets(by = "Disturbance", nrow=1, ncol = 2)+
+  tm_add_legend(type = "symbols",
+                size = 0.75,
+                fill = c(RColorBrewer::brewer.pal(9,"YlOrBr")),
+                labels = c("0","1", "2", "3", "4", 
+                           "5", "6", "7", "8"),
+                title = "Count",
+                orientation = "landscape")+
+  tm_layout(frame = F, legend.show = T,
+            legend.frame = F)
+
+P4
+```
+
+Save Map
+
+```{r}
+tmap_save(
+  filename = "Figures/Figure3b_DisturbanceCountMap_r1.jpeg", 
+  P4, height = 4, width = 8, units = "in")
+```
+
+table values for writing
+
+```{r}
+tapply(counts$counts, 
+       counts$Ecoregion, 
+       function(x) 
+         round(prop.table(table(x == 0)),2)) 
+```
+
+# Evaluating biotic assemblages
+
+## Define assessment and composition functions
+
+### Assessment function
+
+this is the function uses fitted JSDM to predict macroinvertebrate assemblages under present and hindcast conditions. Applies thresholds to be consistent with model performance metrics above.
+
+```{r}
+Assess.Rich <- function(hM = model.env, 
+                        NewData = NewData, 
+                        Region = r, 
+                        threshold = P.threshold[r,"th"]){
+  
+   # matching rownames
+   rn <- intersect(rownames(hM$XData), rownames(NewData))
+     
+   grads <- hM$covNames[-1]
+   # predicted values for present day conditions
+   PV <- computePredictedValues(hM, expected = T)
+   PV <- abind::abind(PV, along = 3)
+  
+   # Setup random effects strucuture for new data. 
+   # Ensures that the predictions are made for the same site
+   sample.id = as.factor(rownames(NewData))
+   studyDesign = data.frame(sample = sample.id)
+   rL = HmscRandomLevel(units = studyDesign$sample)
+
+   PVHC <- predict(hM,
+                    XData = NewData,
+                    studyDesign = studyDesign, 
+                    rL = rL, expected = T)
+  
+   PVHC <- abind::abind(PVHC, along = 3)
+
+  # Ensures rows match between predictions
+  PV <- PV[rn,,]
+  PVHC <- PVHC[rn,,]
+  
+  #################################
+  # assessing differences
+  #################################
+  
+  # Calculate total richness under two scenarios
+  TotalRich.PD <- apply(PV, c(1, 3), function(x) sum(x[x>threshold])) 
+  TotalRich.HC <- apply(PVHC, c(1, 3), function(x) sum(x[x>threshold]))
+  
+  # assess whether the PD mean richness is less than hindcast 
+  TR.support.neg <- sapply(rownames(TotalRich.PD), 
+                           function(sName){mean(mean(TotalRich.PD[sName,]) < 
+                                                  TotalRich.HC[sName, ])})
+  
+  TotalRich.PD <- apply(TotalRich.PD, 1, mean)
+  TotalRich.HC <- apply(TotalRich.HC, 1, mean)
+  
+  P <- data.frame(Region, 
+                  TotalRich.PD,
+                  TotalRich.HC,
+                  TR.support.neg)
+  return(P)
+}
+```
+
+### Composition function
+
+This function identifies increasers (PD \> HC), decreasers (PD \< HC) and taxa with no change in their predicted occurrence probabilities under present-day and hindcasted conditions. Compisitional similarity is then calculated using jaccards similarity index. Increasers were considered present in present-day dataset, and absent in the hindcasted dataset. Decreasers are absent in the present-day dataset and present in the hindcasted dataset. Taxa that do not change are present in both datasets.
+
+```{r}
+
+jaccard <- function(a, b) {
+   a <- names(a)[a==1]
+   b <- names(b)[b==1]
+   intersection = length(intersect(a, b))
+   union = length(a) + length(b) - intersection
+   return (intersection/union)
+}
+
+
+Assess.Comp <- function(hM = model.env,
+                        NewData = NewData, 
+                        Region = r){
+  
+   # matching rownames
+   rn <- intersect(rownames(hM$XData), rownames(NewData))
+   
+   # predicted values for present day conditions
+   PV <- computePredictedValues(hM, expected = T)
+   PV <- abind::abind(PV, along = 3)
+  
+   
+   # Setup random effects strucuture for new data. 
+   # Ensures that the predictions are made for the same site
+   sample.id = as.factor(rownames(NewData))
+   studyDesign = data.frame(sample = sample.id)
+   rL = HmscRandomLevel(units = studyDesign$sample)
+
+   PVHC <- predict(hM,
+                   XData = NewData,
+                   studyDesign = studyDesign, 
+                   rL = rL, expected = T)
+  
+   PVHC <- abind::abind(PVHC, along = 3)
+
+   # Ensures rows match between predictions
+   PV <- PV[rn,,]
+   PVHC <- PVHC[rn,,]
+  
+   PV.mean <- apply(PV, c(1,2), mean)
+   PVHC.mean <- apply(PVHC, c(1,2), mean)
+  
+   df <- data.frame(matrix(NA, nrow(PV), ncol(PV)))
+   colnames(df) <- colnames(PV)
+   rownames(df) <- rownames(PV)
+   hc <- df
+   pd <- df
+     
+   for (i in rownames(PV)){
+     #i <- rownames(PV)[85]
+     
+     # calculate probability
+     for (j in colnames(PV.mean)){#spName){
+       #j <- colnames(PV.mean)
+       df[i, j] <- mean(PV.mean[i, j] < PVHC[i, j, ])
+     }
+     
+     # more than 90% of the HC values are greater than PD, 
+     # PD is less than HC (decreaser)
+     decreaser <- na.omit(names(df)[df[i, ] >= 0.9])
+     # less than 10% of the HC values are greater than PD, 
+     # PD is greater than HC (increaser)
+     increaser <- na.omit(names(df)[df[i, ] <= 0.1])  
+     # no change
+     NoChange <- na.omit(names(df)[df[i, ] < 0.9 & df[i, ] > 0.1]) 
+          
+     df[i, increaser] <- "I"
+     df[i, decreaser] <- "D"
+     df[i, NoChange] <- "NC"
+          
+     pd[i,increaser] <- 1 # presently higher
+     hc[i,increaser] <- 0
+           
+     pd[i,decreaser] <- 0 # presently lower
+     hc[i,decreaser] <- 1
+           
+     hc[i,NoChange] <- 1 # no change between
+     pd[i,NoChange] <- 1 
+        
+     df[i,"Jaccard_S"] <- jaccard(hc[i,], pd[i,])
+   }
+  
+  return(data.frame(Region, df))
+}
+
+```
+
+## Assessing change in biotic assemblages
+
+Read in data
+
+```{r}
+library(parallel)
+library(Hmsc)
+library(ggplot2)
+library(tmap) 
+
+FittedModelPath <- "Model_Fit_JSDM_Final"
+# list of fitted model names (see Kopp et al 2023 for details)
+modelnames <- grep(
+  "1819", 
+  list.files(FittedModelPath, 
+             full.names = F), 
+  value = T)
+
+Dat <- read.csv("Hindcast_Environmental_Data_r1.csv")
+
+#create wide format (i.e. site x environmental variable)
+NewPredDat <- reshape2::dcast(
+  UID + Ecoregion + LAT_DD + LON_DD ~ variable, 
+  data = Dat, value.var = "newValue")
+rownames(NewPredDat) <- NewPredDat$UID
+
+```
+
+Check whether extrapolation is an issue. Sites that had hindcasted values beyond the range of values currently observed in the region were set the the minimum. the output from this analysis records the number of sites within each region that was changed to the minimum values. The justification for using the min is that they are close to the hindcasted estimates but not subjected to extrapolation concerns
+
+```{r}
+
+out <- data.frame()
+for (mn in modelnames){
+  # mn <- modelnames[5]
+  r <- unlist(lapply(strsplit(mn, "_"), "[", 3))
+  load(paste0(FittedModelPath, "/",  mn))
+  tmp <- setNames(
+    data.frame(
+      matrix(NA,
+             nrow = 1,
+             ncol = dim(model.env$XData)[2])),
+    names(model.env$XData))
+  for (var in names(model.env$XData)){
+    #var <- names(model.env$XData)[3]
+    
+    vec1 <- model.env$XData[,var]
+    vec2 <- NewPredDat[rownames(model.env$XData),var]
+  
+    # All values that were outside the range of 
+    # observed values were adjusted to the minimum observed
+    if(any(vec2 < min(vec1) | vec2 > max(vec1))){
+      selectRows <- rownames(model.env$XData)[which(vec2 < min(vec1))]
+      NewPredDat[selectRows,var] <- min(vec1)
+      
+      #print(min(vec1))
+      # neg <- sum(vec2 < min(vec1))
+      # no had hindcast estimates exceed the present-day conditons.
+      # pos <- sum(vec2 > max(vec1))   
+      #print(data.frame(neg, pos, var))
+      tmp[1, var] <- sum(vec2 < min(vec1)|vec2 > max(vec1))
+      rownames(tmp) <- r
+    }
+  }
+  out <- rbind(out,tmp)
+}
+
+```
+
+```{r}
+out
+```
+
+assess the relative effects of each stressor on macroinvertebrate richness by grouping the individual stressors into categories (i.e. salinity, nutrients, Phab, and Climate) and evaluating differences in genus richness. The effects of all stressors were assessed by differences in richness after changing all stressors. Takes about 4mins to run.
+
+```{r}
+# thresholds improve model fit and were used here for consistency. 
+P.threshold <- read.csv("Figures/Table3_jsdmPerformance.csv", 
+                        row.names = "Row.names")
+
+
+t1 <- Sys.time()
+cl <- parallel::makeCluster(length(modelnames))
+parallel::clusterExport(cl, c("NewPredDat", 
+                              "Assess.Rich",
+                              "FittedModelPath",
+                              "P.threshold"), 
+                        envir = environment())
+parallel::clusterEvalQ(cl, library(Hmsc))
+
+out <- parallel::parSapply(cl, modelnames, simplify = F, function(mn){
+  #mn <- modelnames[1]
+  
+  # load HMSC model
+  r <- unlist(lapply(strsplit(mn, "_"), "[", 3))
+  load(paste0(FittedModelPath, "/",  mn))
+  
+  # Effects of changing a category of variables 
+  out.list <- list()
+  
+  #group the individual variable into categories
+  scenarios <- list(Nutrients = c("NTL","PTL"),
+                    Salinity = c("CL","SO4"),
+                    Climate = c("TMEAN_S_XXXX_PT","PSUMPY_XXXX_PT"),
+                    Phab = c("W1_HALL", "LSUB_DMM"))
+  
+  for (i in 1:length(scenarios)){
+    #i <- 1 
+    g <- scenarios[[i]]
+    
+    # read in present day data 
+    Xdata.PD <- model.env$XData
+    
+    # update gradient g to hindcast value
+    Xdata.PD[, g] <- NewPredDat[rownames(Xdata.PD), g]
+    Xdata.PD <- Xdata.PD[complete.cases(Xdata.PD), ]
+    
+    # assess the effect of a single gradient on richness
+    # all other variables remain unchanged
+    rich <- Assess.Rich(hM = model.env,
+                        NewData = Xdata.PD, 
+                        Region = r,
+                        threshold = P.threshold[r,"th"])
+    
+    out.list[[paste0(g, collapse = "_")]] <- data.frame(var = paste0(g, collapse = "_"), 
+                                                        rich)
+  }
+  
+  # repeat for all gradients 
+  Xdata.PD <- NewPredDat[rownames(model.env$XData),]
+  Xdata.PD <- Xdata.PD[complete.cases(Xdata.PD),]
+  
+  rich <- Assess.Rich(hM = model.env,
+                       NewData = Xdata.PD, 
+                       Region = r, 
+                       threshold = P.threshold[r,"th"])
+  
+  out.list[["ALL"]] <- data.frame(var = "ALL",rich)
+  
+  return(out.list)
+})
+
+parallel::stopCluster(cl)
+t2 <- Sys.time()
+t2-t1
+
+```
+
+save results
+
+```{r}
+saveRDS(out, file = "Richness_Results_R1.rds")
+```
+
+### Assess composition
+
+Run composition function for each region. Takes about 1min to run
+
+```{r}
+
+t1 <- Sys.time()
+cl <- parallel::makeCluster(length(modelnames))
+parallel::clusterExport(cl, 
+                        c("NewPredDat", 
+                          "Assess.Comp",
+                          "FittedModelPath",
+                          "jaccard"), 
+                        envir = environment())
+parallel::clusterEvalQ(cl, library(Hmsc))
+
+out <- parallel::parSapply(cl, modelnames, simplify = F, function(mn){
+  
+  # load HMSC model
+  r <- unlist(lapply(strsplit(mn, "_"), "[", 3))
+  load(paste0(FittedModelPath, "/",  mn))
+  
+  Xdata.PD <- NewPredDat[rownames(model.env$XData),]
+  Xdata.PD <- Xdata.PD[complete.cases(Xdata.PD),]
+  
+  comp <- Assess.Comp(hM = model.env,
+                       NewData = Xdata.PD, 
+                       Region = r)
+  
+  out <- comp
+  
+  return(out)
+})
+
+parallel::stopCluster(cl)
+t2 <- Sys.time()
+t2-t1
+
+```
+
+save results
+
+```{r}
+saveRDS(out, file = "Composition_Results_R1.rds")
+```
+
+## Create Figures
+
+```{r}
+library(RColorBrewer)
+library(tmap)
+library(sf)
+library(ggpattern)
+
+maps <- read_sf("Data_Raw/Ag_Ecoregions9_20121005.shp")
+maps$ecoregion <- maps$WSA_9
+
+#location information for mapping
+Dat <- read.csv("Hindcast_Environmental_Data.csv")
+xyData <- unique(Dat[,c("UID", "LAT_DD", "LON_DD")])
+
+```
+
+### Compile data for plotting
+
+Summarizes the results from the assessment analysis. Data is used to identify sites that changed in richness
+
+```{r}
+# load saved results
+out.list.full <- readRDS("Richness_Results_R1.rds")
+
+plotdata <- data.frame()
+for (i in 1:length(out.list.full)){
+  #i <- 1
+  tmp <- lapply(out.list.full[[i]], function(x) {
+    #x <- out.list.full[[i]][[1]]
+    tbl <- data.frame(var = x$var, 
+                      Region = x$Region,
+                      UID = rownames(x),
+                      Resp.diff = x$TotalRich.HC - x$TotalRich.PD,
+                      RR.support.neg = x$TR.support.neg,
+                      Resp.diff.Support = ifelse(x$TR.support.neg >= 0.75 | (1 - x$TR.support.neg) >= 0.75,
+                                           "Y","N"))
+    return(tbl)
+  })
+  
+  tmp <- do.call(rbind, tmp)
+  plotdata <- rbind(plotdata, tmp)
+}
+
+plotdata$titles <- factor(plotdata$var, 
+                          levels = c("NTL_PTL", "CL_SO4",
+                                     "W1_HALL_LSUB_DMM",
+                                     "TMEAN_S_XXXX_PT_PSUMPY_XXXX_PT",
+                                     "ALL"))
+
+levels(plotdata$titles) <- c("Nutrients", "Salinity", 
+                             "Physcial Habitat",        
+                             "Climate", "ALL")
+#Remove estrapolated sites 
+plotdata<-plotdata[!plotdata$UID%in%rmFlaggedSites,]
+```
+
+### Map relative importance of stressors
+
+Identify most important variable for each site as the one associated with the greatest change in richness
+
+```{r}
+
+# identify the sites that have a significant change in richness
+mapData_stressor <- plotdata[plotdata$Resp.diff.Support == "Y" &
+                               plotdata$var != "ALL", ]
+
+# add coordinates and create SF file for mapping 
+mapData_stressor <- merge(xyData, mapData_stressor, by = "UID")
+
+# create mapping sf file for mapping 
+mapData_stressor <- st_as_sf(mapData_stressor, 
+                             coords = c("LON_DD","LAT_DD"), 
+                             crs = 4269)
+
+```
+
+Create tmap of most important stressors Figure
+
+```{r}
+
+P11 <- tm_shape(maps) +
+  tm_borders() +
+  tm_shape(mapData_stressor, legend.show = T) +
+  tm_symbols(size = 0.35, 
+             shape = 21,
+             fill = "Resp.diff", 
+             fill.scale = 
+               tm_scale_intervals(midpoint = 0,
+                                   breaks = c(-15, -10, -5, -2.5, -1, 
+                                              0, 1, 2.5, 5, 10, 15), 
+                                   values = "brewer.br_bg"),
+             fill.legend = tm_legend(show = F))+
+  tm_add_legend(size=1,
+                fill = brewer.pal(n=9,"BrBG")[c(1:4,6:9)],
+                #fill.scale = tm_scale_intervals(values = "brewer.br_bg"),
+                labels = c("< -15 ",
+                             "-15 to -10",
+                             " -10 to -5 ",
+                             "-2.5 to < 0",
+                             " > 0 to 2.5 ",
+                             " 5 to 10 ",
+                             " 10 to 15 ",
+                             " > 15  "),
+                 title = "Change from \npresent day \ngenus richness",
+                 is.portrait = F) +
+  tm_facets(by = "titles", nrow = 2 , free.coords = F)+
+  tm_layout(legend.outside = T,
+            #legend.position = c("center","top"),
+            legend.outside.position = "top",
+            legend.text.size = 0.75, 
+            outer.margins = c(0.01,0.01,0.01,0.01),
+            inner.margins = c(0.01, 0.01, 0.01, 0.01),
+            legend.title.size = 1)
+P11
+```
+
+Save tmap figure
+
+```{r}
+tmap_save(
+  filename = "Figures/Figure4a_RichnessChange_Stressor_R1.jpeg",
+  P11, height = 5, width = 11, units = "in")
+```
+
+numbers for writing
+
+```{r}
+# create wide format populated with the number of taxa that have changed
+#mapData_stressor <- reshape2::dcast(UID + Region ~ titles, 
+ #                                   value.var = "Resp.diff", 
+  #                                  data = mapData_stressor, 
+   #                                 fill = 0)
+
+# identify the variable name and value associated with the greatest absolute change in taxon richness
+#MostChange <- apply(mapData_stressor[,-c(1,2)], 1, function(x) names(x)[which.max(abs(x))])
+#ValueChange <- apply(mapData_stressor[,-c(1,2)], 1, function(x) x[which.max(abs(x))])
+#mapData_stressor$MostChange <- MostChange
+#mapData_stressor$ValueChange <- ValueChange 
+```
+
+### Map additive effects of all stressors
+
+This is the change in aggregated predicted probabilities from changing the environmental variables
+
+```{r}
+Condition <- plotdata[plotdata$var == "ALL", ] 
+
+# find maximum value, either negative or positive support. 
+# If this values is >0.9, there is a difference in richness 
+support <- sapply(rownames(Condition), simplify = F, function(x){
+  max(1 - Condition[x,"RR.support.neg"], Condition[x, "RR.support.neg"])})
+Condition$support <- unlist(support)
+
+# add uncertainity classes based on support
+Condition$Certainty <- NA
+Condition$Certainty[Condition$support < 0.75] <- "< 0.75"
+Condition$Certainty[Condition$support >= 0.75 & Condition$support < 0.90] <- "0.75-0.90"
+Condition$Certainty[Condition$support >= 0.90] <- "> 0.90"
+Condition$Certainty <- factor(Condition$Certainty, 
+                            levels = c("< 0.75", "0.75-0.90", "> 0.90"))
+
+```
+
+Map sites that have changed in richness
+
+```{r}
+# add coodeinates and create sf object for mapping
+mapData <- merge(xyData, Condition, by = "UID")
+mapData <- st_as_sf(mapData, coords = c("LON_DD", "LAT_DD"), crs = 4269)
+
+# drop points with lowest certainity of change. It makes the map much less cluttered 
+map.pts <- mapData[mapData$Certainty != "< 0.75",]
+map.pts$Certainty <- factor(as.character(map.pts$Certainty))
+
+
+P10 <- tm_shape(maps) +
+  tm_borders() +
+  tm_shape(map.pts, legend.show = T) +
+  tm_symbols(size = 0.75, 
+             shape = 21,
+             fill = "Resp.diff", 
+             fill.scale = 
+               tm_scale_intervals(midpoint = 0,
+                                   breaks = c(-15, -10, -5, -2.5,  
+                                              0, 2.5, 5, 10, 15), 
+                                   values = "brewer.br_bg"),
+             fill.legend = tm_legend(show = F))+
+  tm_add_legend(size=1,
+                fill = brewer.pal(n=9,"BrBG")[c(1:4,6:9)],
+                #fill.scale = tm_scale_intervals(values = "brewer.br_bg"),
+                labels = c("< -15 ",
+                             "-15 to -10",
+                             " -10 to -5 ",
+                             "-2.5 to < 0",
+                             " > 0 to 2.5 ",
+                             " 5 to 10 ",
+                             " 10 to 15 ",
+                             " 15 < "),
+                 title = "Change in Genus Richness",
+                 orientation = "landscape") +
+   tm_scalebar(position = c(0.5, 0.0), text.size = 0.75, lwd = 1)+
+  tm_layout(frame = F, 
+            legend.show = F,
+            legend.text.size = 1.25, 
+            legend.title.size = 1, 
+            inner.margins = c(0.025, 0.0, 0.0, 0.0),
+            legend.position = c("center","top")) 
+
+
+
+P10
+```
+
+save map
+
+```{r}
+tmap_save(filename = "Figures/Figure4B_RichnessChange_R1.jpeg", 
+          P10, height = 11, width = 15, units = "in")
+```
+
+## Evaluate increase or decreaser taxa
+
+Identify which taxa increase or decrease in the presence of anthorpogenic disturbance. For every site, the predicted occurrence probability for all taxa in the regional species pool can increase, decrease or stay the same. The proportion of sites where each genus either increases or decreases elucidates how genera may respond to changing environmental conditions. Higher taxonomic levels were used to summarize this information as the average proportion of sites each taxa increases or decreases and elucidates how groups of taxa may respond to changing environmental conditions.
+
+```{r}
+# use taxonomy to create summary groups. 
+taxonFiles <- grep(
+  "Taxonomy", 
+  list.files(FittedModelPath, recursive = T), 
+  value = T)
+
+# load taxonomy files
+taxonomy <- data.frame()
+for (i in taxonFiles){
+  tmp <- read.csv(
+    paste0(FittedModelPath,"/", i), 
+    row.names = "X")  
+  
+  taxonomy <- rbind(taxonomy, tmp)
+}
+
+taxonomy <- unique(taxonomy)
+
+# set major groups
+taxonomy$Groups <- NA
+taxonomy$Groups2 <- NA
+
+taxonomy$Groups[taxonomy$CLASS == "INSECTA"] <- "Insects"
+taxonomy$Groups[taxonomy$CLASS != "INSECTA"] <- "Non-Insects"
+
+taxonomy$Groups2[
+  taxonomy$ORDER %in% 
+    c("EPHEMEROPTERA", "PLECOPTERA", "TRICHOPTERA")] <- "EPT"
+
+taxonomy$Groups2[
+  taxonomy$FAMILY == "CHIRONOMIDAE"] <- "CHIRONOMIDAE"
+
+taxonomy$Groups2[
+  taxonomy$CLASS == "INSECTA" & 
+    is.na(taxonomy$Groups2)] <- "Other Insects"
+
+taxonomy$Groups2[
+  taxonomy$Groups=="Non-Insects" & !taxonomy$PHYLUM %in% 
+    c("ARTHROPODA","MOLLUSCA")] <- "Other Non-Insects"
+
+taxonomy$Groups2[
+  taxonomy$Groups=="Non-Insects" & taxonomy$PHYLUM %in% 
+    c("ARTHROPODA","MOLLUSCA")] <-  taxonomy$PHYLUM[
+      taxonomy$Groups == "Non-Insects" & taxonomy$PHYLUM %in% 
+        c("ARTHROPODA","MOLLUSCA")]
+
+unique(taxonomy$PHYLUM)
+
+# summarize mean proportion of sites for groups
+composition <- readRDS("Composition_Results_r1.rds")
+composition <- lapply(composition, function(x) 
+  data.frame(UID = rownames(x),x))
+
+composition <- do.call(
+  rbind,
+  lapply(composition,
+         reshape2::melt, 
+         id.vars = c("UID","Region"),
+         value.name = "value", 
+         variable.name = "GENUS"))
+
+composition[!composition$UID%in%rmFlaggedSites,]
+
+MajorGroups <- composition %>%
+  group_by(GENUS, Region)%>%
+  #calculates the proporiton of sites where each genus was 
+  #either increaser or decreaser 
+  reframe(tbl = prop.table(table(value)), 
+            v = names(prop.table(table(value))))%>%
+  merge(taxonomy, ., by = "GENUS") %>%
+  group_by(Region,Groups,v)%>%
+  #calculates mean proportion if sites where 
+  #each taxa increases or decreases
+  summarize(m = round(mean(tbl),2),.groups = "drop")%>%
+  filter(v!="NC") %>%
+  reshape2::acast(Groups~Region+v, value.var = "m")
+
+subGroups <- composition %>%
+  group_by(GENUS, Region)%>%
+  reframe(tbl = prop.table(table(value)), 
+            v = names(prop.table(table(value))))%>%
+  merge(taxonomy, ., by = "GENUS") %>%
+  group_by(Region, Groups2, v)%>%
+  summarize(m = round(mean(tbl),2),.groups = "drop")%>%
+  filter(v!="NC") %>%
+  reshape2::acast(Groups2~Region + v, value.var = "m")
+
+# combine and reorder groups.
+tbl <- rbind(MajorGroups,subGroups)
+tbl <- tbl[c("Insects", "EPT", "CHIRONOMIDAE", "Other Insects", 
+             "Non-Insects", "ARTHROPODA", "MOLLUSCA", 
+             "Other Non-Insects"),]
+
+```
+
+```{r}
+write.csv(tbl, 
+          file = 
+            "Figures/Table4_Composition_Increase_Decrease_r1.csv")
+```
+
+### Create barchart with NRSA weights
+
+Append NRSA weights to assess the proportion if sites in each region that may change as a result of genus richness
+
+```{r}
+library(ggplot2)
+library(ggpattern)
+library(spsurvey)
+
+weights <- read.csv(
+  "Data_Raw/nrsa_1819_site_information_-_data.csv", 
+  stringsAsFactors = F)
+
+weights <- weights[weights$WGT_TP_CORE != 0 & weights$VISIT_NO == 1,]
+
+composition <- readRDS("Composition_Results_r1.rds")
+composition <- lapply(composition, function(x) 
+  data.frame(UID = rownames(x), x[,c("Region", "Jaccard_S")]))
+composition <- do.call(rbind, composition)
+
+df <- Reduce(function(x,y) merge(x,y, by = "UID", all.x = T), 
+           list(weights[,c("UID", "LAT_DD83","LON_DD83", 
+                           "AG_ECO9", "WGT_TP_CORE")], 
+                Condition, 
+                composition))
+
+df$Certainty <- as.character(df$Certainty)
+df$Certainty[is.na(df$Certainty)] <- "Not Assessed"
+df$Certainty[df$Certainty == "< 0.75" & 
+               df$Jaccard_S < 0.9] <- "Composition" 
+
+# sites taht were potentially extrapolated via random forest
+df[df$UID %in% rmFlaggedSites, "Certainty"] <- "Not Assessed"
+sum(df$Certainty!="Not Assessed")
+a<-cat_analysis(df,
+                vars="Certainty",
+                subpops = "AG_ECO9",
+                xcoord = "LON_DD83", 
+                ycoord = "LAT_DD83",
+                weight = "WGT_TP_CORE")
+
+a <- a[a$Category != "Total",]
+a$Category <- factor(a$Category, 
+                  levels = c("Not Assessed", 
+                             "< 0.75", 
+                             "Composition", 
+                             "0.75-0.90", 
+                             "> 0.90"))
+
+ordLevels <- a[a$Category=="> 0.90" | a$Category=="0.75-0.90", 
+              c("Subpopulation", "Estimate.P")]
+
+ordLevels <- tapply(ordLevels$Estimate.P, ordLevels$Subpopulation,sum)
+ordLevels <- names(ordLevels)[order(ordLevels)] 
+#ordLevels <- as.character(ordLevels[order(ordLevels$value),"Var1"])
+a$Subpopulation <- factor(as.character(a$Subpopulation), 
+                          levels = ordLevels)
+
+
+P11 <- ggplot(a, aes(x = Subpopulation, 
+                     y = Estimate.P, 
+                     fill = Category))+
+ geom_bar_pattern(aes(pattern=Category),
+                  position="stack", 
+                  stat="identity", 
+                  color='black', 
+                  pattern_fill = "black",
+                  pattern_spacing = 0.015) + 
+  theme_bw() +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("orange","white", "white", "grey", "black")) +
+  labs(
+    title = "Support for benthic macroinvertebrate assemblage change", 
+    pattern = "",
+    fill = "") + 
+  scale_pattern_manual(
+    values=c('none','none', 'stripe', 'none', 'none')) +
+  theme(
+    legend.title = element_text(hjust = 0.1), 
+    legend.position = "top")+
+  ylab("Percentage of Streams") +
+  xlab("Ecoregion") 
+
+
+
+```
+
+save plot
+
+```{r}
+ggsave(
+  filename = "Figures/Figure5_ChangeRichnessComposition_r1.jpeg", 
+  P11, 
+  height = 5, 
+  width = 6, 
+  units = "in")
+```
+
+numbers for writing– percent of sites within each category
+
+```{r}
+df<-a
+# the theshlds are cumulative
+unique(df$Category)
+df$Estimate.P
+df$Subpopulation
+change <- df[df$Category %in% 
+               c("Composition", 
+                 "> 0.90", 
+                 "0.75-0.90"),]
+tapply(change$Estimate.P, change$Subpopulation, 
+       function(x) round(sum(x),2))
+
+change <- df[df$Category  %in% c("> 0.90", "0.75-0.90"),]
+tapply(change$Estimate.P, change$Subpopulation, 
+       function(x) round(sum(x),2))
+
+change <- df[df$Category %in% c("> 0.90"),]
+tapply(change$Estimate.P, change$Subpopulation, 
+       function(x) round(sum(x),2))
+
+change <- df[df$Category %in% c("Composition"),]
+tapply(change$Estimate.P, change$Subpopulation, 
+       function(x) round(sum(x),2))
+
+change <- df[df$Category %in% c("Not Assessed"),]
+tapply(change$Estimate.P, change$Subpopulation, 
+       function(x) round(sum(x),2))
+
+```
+
+### Ranked comparisons to NRSA
+
+```{r}
+NRSA<-data.frame(Region = c("CPL","NAP","NPL","
+                            SAP","SPL","TPL",
+                            "UMW","WMT","XER"),
+                 value = c(68,48,44,49,26,49,29,22,58))
+NRSA$Rank[order(NRSA$value)]<-1:9
+
+JSDM<-data.frame(Region = c("WMT", "UMW", "NAP", 
+                            "CPL", "SAP", "XER",
+                            "SPL", "TPL", "NPL"), 
+                 value = c(14.31, 38.40, 42.53,
+                           38.36, 57.54, 44.73,
+                           72.37, 75.48, 72.00))
+JSDM$Rank[order(JSDM$value)]<-1:9
+RankComp <- merge(JSDM,NRSA,by = "Region")
+
+RankedPlot <- ggplot(RankComp, aes(x = Rank.x, 
+                     y = Rank.y, 
+                     label = Region))+
+  geom_text()+
+  theme_bw()+ 
+  xlab("Rank from Hindcast")+
+  ylab("Rank from NRSA")+
+  geom_abline(slope = 1, intercept =0)
+  theme(
+  axis.text.x = element_blank(),
+  axis.text.y = element_blank())
+
+ggsave(filename = paste0("Figures/Figure6_Comparision2NRSA.jpeg"), 
+       RankedPlot,
+       height = 5, width = 6, units = "in")
+
+```
+
+# Example figure for assessing richness
+
+this is an example that i moved here from above because it was out of place, if you need it later just uncomment. Not sure why copy and paste are so this
+
+```{r}
+mn <- modelnames[3] 
+r <- unlist(lapply(strsplit(mn, "_"), "[", 3)) 
+load(paste0(FittedModelPath, "/",  mn))  
+
+# read in present day data  
+Xdata.PD <- model.env$XData      
+
+# update gradient g to hindcast value 
+Xdata.PD <- NewPredDat[rownames(Xdata.PD), ] 
+Xdata.PD <- Xdata.PD[complete.cases(Xdata.PD), ]      
+
+# assess the effect of a single gradient on richness 
+# all other variables remain unchanged 
+rich <- Assess.Rich(hM = model.env,
+                    NewData = Xdata.PD,
+                    Region = r,
+                    threshold = P.threshold[r,"th"])  
+
+# below data is generated using the same process outlined in the function, Assess.Rich 
+hM = model.env;  
+NewData = Xdata.PD;  
+Region = r;  
+threshold = P.threshold[r,"th"]      
+
+# matching rownames 
+rn <- intersect(rownames(hM$XData), rownames(NewData)) 
+grads <- hM$covNames[-1]  
+
+# predicted values for present day conditions 
+PV <- computePredictedValues(hM, expected = T) 
+PV <- abind::abind(PV, along = 3)    
+
+# Setup random effects strucuture for new data.  
+# Ensures that the predictions are made for the same site 
+sample.id = as.factor(rownames(NewData)) 
+studyDesign = data.frame(sample = sample.id) 
+rL = HmscRandomLevel(units = studyDesign$sample)  
+
+# predicted values for hindcast conditions 
+PVHC <- predict(hM, 
+                XData = NewData, 
+                studyDesign = studyDesign,
+                rL = rL, expected = T)   
+
+PVHC <- abind::abind(PVHC, along = 3)  
+# Ensures rows match between predictions 
+PV <- PV[rn,,] 
+PVHC <- PVHC[rn,,] 
+obs <- rowSums(hM$Y[rn,])    
+
+# Calculate total richness under two scenarios 
+TotalRich.PD <- apply(
+  PV, c(1, 3), function(x){   
+    sum(x[x>threshold])}) 
+
+TotalRich.HC <- apply(
+  PVHC, c(1, 3), function(x){   
+    sum(x[x>threshold])})    
+
+# assess whether the PD mean richness is less than hindcast  
+TR.support.neg <- sapply(
+  rownames(TotalRich.PD), 
+  function(sName){   
+    mean(mean(TotalRich.PD[sName,]) < TotalRich.HC[sName, ])
+    })
+
+# Determine whether observed values is within the posterior distribution 
+ObsProb <- data.frame() 
+for(i in rn){   
+  #i <- rn[3]   
+  prob <- data.frame(
+    ObsProb = mean(obs[i] > TotalRich.PD[i,]))
+  
+  ObsProb <- rbind(ObsProb, prob) 
+}
+
+
+1 - mean(ObsProb==1 | ObsProb==0) 
+```
+
+#### Plot 1
+
+```{r}
+# very little support for present day richness being lower than hindcast--- Most of posterior distribution is greater than the present day condition.    
+which(
+  ObsProb[,"ObsProb"] > 0.025 & 
+    ObsProb[,"ObsProb"] < 0.975 &
+    (TR.support.neg) < 0.1)
+
+site.example <- 141 
+#Positive   
+# site.example <- 139   
+# site.example <- c(117)      
+# select data for plot 1   
+
+df <- rbind(
+  reshape2::melt(
+    data.frame(
+      t(TotalRich.PD[site.example,]),
+      State = "PD"), 
+    id.vars = "State"),     
+  reshape2::melt(data.frame(
+    t(TotalRich.HC[site.example,]), 
+    State = "HC"), 
+    id.vars = "State"))      
+
+df$State <- factor(df$State, levels=c("PD","HC"))   
+PD.mean <- mean(TotalRich.PD[site.example,])   
+HC.Quant <- quantile(TotalRich.HC[site.example,],                        probs = c(0.1,0.9))      
+
+#names(df)   
+#create initial plot  
+p1 <- ggplot(df, aes(x = value, fill = State))+     
+  geom_density(alpha = 0.5) +     
+  geom_vline(aes(xintercept = PD.mean),
+             lwd = 1, lty = 2)+     
+  theme_bw()+      
+  theme(panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        legend.position = "none")+     
+  scale_fill_manual(values=c("white","gray"))+     
+  labs(x="Richness", y="Density")    
+
+#The data containded within the ggplot object  
+#str(ggplot_build(p)$data[[1]])   
+#ggplot_build(p)$data[[1]]$fill      
+to_fill <- data.frame(
+  x = ggplot_build(p1)$data[[1]]$x,     
+  y = ggplot_build(p1)$data[[1]]$y,     
+  group = ggplot_build(p1)$data[[1]]$group)
+
+#library(ggpattern)    
+p1 <- p1 +      
+  geom_area_pattern(
+    data = to_fill[to_fill$x <= HC.Quant["10%"]&                                         to_fill$group == 2 , ],
+    aes(x = x, y = y),              
+    fill = alpha("black",0.5),      
+    pattern = 'stripe',
+    pattern_density = 0.25,
+    pattern_spacing = 0.025,  
+    pattern_key_scale_factor = 0.6)
+
+p1 <- p1 +       
+  geom_area_pattern(
+    data = to_fill[to_fill$x >= HC.Quant["90%"]&                                         to_fill$group == 2, ],
+    aes(x = x, y = y),              
+    fill = alpha("black",0.5),
+    pattern = 'stripe',
+    pattern_density = 0.25,
+    pattern_spacing = 0.025,
+    pattern_key_scale_factor = 0.6)    
+
+p1
+```
+
+#### Plot 2
+
+```{r}
+which(ObsProb[,"ObsProb"] > 0.025 &
+        ObsProb[,"ObsProb"] < 0.975 &
+        (TR.support.neg) > 0.9)
+
+site.example <- 139
+df <- rbind(
+  reshape2::melt(
+    data.frame(
+      t(TotalRich.HC[site.example,]), 
+      State = "HC"), id.vars = "State"),
+  reshape2::melt(
+    data.frame(
+      t(TotalRich.PD[site.example,]),
+      State = "PD"), id.vars = "State"))
+
+df$State <- factor(df$State, levels=c("PD","HC"))
+P2.mean <- mean(TotalRich.PD[site.example,])   
+P2HC.Quant <- quantile(TotalRich.HC[site.example,],                        probs = c(0.1,0.9))   
+
+#names(df)   
+#create initial plot   
+p2 <- ggplot(df, aes(x=value, fill = State))+
+  geom_density(alpha = 0.5)+
+  geom_vline(aes(xintercept = P2.mean),
+             lwd = 1, lty = 2)+     
+  theme_bw()+     
+  theme(panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black"),
+        legend.position="none")+     
+  scale_fill_manual(values=c("white","gray"))+     
+  labs(x="Richness",y="Density")
+
+to_fill <- data.frame(     
+  x = ggplot_build(p2)$data[[1]]$x,     
+  y = ggplot_build(p2)$data[[1]]$y,     
+  group = ggplot_build(p2)$data[[1]]$group)
+
+p2 <- p2 +      
+  geom_area_pattern(
+    data = to_fill[to_fill$x <= P2HC.Quant["10%"]&                                         to_fill$group == 2 , ],
+    aes(x = x, y = y),
+    fill = alpha("black",0.5),
+    pattern = 'stripe',
+    pattern_density = 0.25,
+    pattern_spacing = 0.025,
+    pattern_key_scale_factor = 0.6)
+
+p2 <- p2 +       
+  geom_area_pattern(
+    data = to_fill[to_fill$x >= P2HC.Quant["90%"] &                                         to_fill$group == 2 , ],
+    aes(x = x, y = y),
+    fill = alpha("black",0.5),
+    pattern = 'stripe',
+    pattern_density = 0.25,
+    pattern_spacing = 0.025,
+    pattern_key_scale_factor = 0.6)   
+
+p2
+```
+
+#### Plot 3
+
+```{r}
+######    
+which(ObsProb[,"ObsProb"] > 0.025 &
+        ObsProb[,"ObsProb"] < 0.975 &
+        (TR.support.neg) < 0.75 & (TR.support.neg) > 0.25)
+
+site.example <-  110       
+df <- rbind(
+  reshape2::melt(
+    data.frame(
+      t(TotalRich.HC[site.example,]),
+      State = "HC"), 
+    id.vars = "State"),       
+  reshape2::melt(
+    data.frame(
+      t(TotalRich.PD[site.example,]),
+      State = "PD"), id.vars = "State"))
+
+df$State <- factor(df$State, levels=c("PD","HC"))
+P3.mean <- mean(TotalRich.PD[site.example,])   
+P3HC.Quant <- quantile(TotalRich.HC[site.example,],
+                       probs = c(0.1,0.9))   
+#names(df)   
+#create initial plot   
+p3 <- ggplot(df, aes(x=value, fill = State))+
+  geom_density(alpha = 0.45)+     
+  geom_vline(aes(xintercept = P3.mean),
+             lwd = 1, lty = 2)+     
+  theme_bw() +      
+  theme(panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"), 
+        legend.title = element_text(colour="black",                                        size=10, face="bold"),           
+        legend.position="none")+     
+  scale_fill_manual(values=c("white","gray"))+     
+  labs(x="Richness", y="Density")     
+
+to_fill <- data.frame(     
+  x = ggplot_build(p3)$data[[1]]$x,     
+  y = ggplot_build(p3)$data[[1]]$y,     
+  group = ggplot_build(p2)$data[[1]]$group)
+
+p3 <- p3 +      
+  geom_area_pattern(
+    data = to_fill[to_fill$x <= P3HC.Quant["10%"]&                                         to_fill$group == 2 , ],
+    aes(x = x, y = y),
+    fill = alpha("black",0.5),
+    pattern = 'stripe',
+    pattern_density = 0.25,
+    pattern_spacing = 0.025,
+    pattern_key_scale_factor = 0.6)        
+
+p3 <- p3 +       
+  geom_area_pattern(
+    data = to_fill[to_fill$x >= P3HC.Quant["90%"] &                                         to_fill$group == 2, ],              
+    aes(x = x, y = y),  
+    fill = alpha("black",0.5),
+    pattern = 'stripe',
+    pattern_density = 0.25, 
+    pattern_spacing = 0.025,
+    pattern_key_scale_factor = 0.6)    
+
+p3
+```
+
+#### combine and print plot
+
+```{r}
+df$State <- factor(df$State) 
+levels(df$State) <- c("Present Day", "Hindcast")
+pleg <- ggplot(df, aes(x=value, fill = State))+   
+  geom_density(alpha = 0.5)+   
+  geom_vline(aes(xintercept = P3.mean), 
+             lwd = 1, lty = 2)+   
+  theme_bw() +    
+  theme(panel.border = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        legend.title = element_text(colour="black", 
+                                    size=10,
+                                    face="bold"))+
+  
+  #guides(fill=guide_legend(nrow=1))+   
+  scale_fill_manual(values=c("white","gray"))+   
+  labs(x="Richness", y="Density")    
+
+grobs <- ggplotGrob(pleg)$grobs 
+legend <- grobs[[which(
+  sapply(grobs, function(x) x$name) == "guide-box")]]  
+
+pgrid <- plot_grid(p1, p2, p3, labels = c('A', 'B', "C"), rows = 1)  
+
+pgrid <- plot_grid(pgrid, legend, ncol = 2, rel_widths = c(1, .2))    
+
+ggsave(filename = "Figures/FigureXX_Example_Richness.jpeg",       
+       pgrid, height = 5, width = 11, units = "in")
+
+
+200/log(20)
+```
